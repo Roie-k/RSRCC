@@ -1,0 +1,10 @@
+torch>=2.4.0
+torchvision
+transformers>=4.50.0
+accelerate
+pillow
+numpy
+pandas
+scipy
+google-genai
+huggingface_hub
