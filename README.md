@@ -1,12 +1,14 @@
 # Ranking the Changes: Reinforced Best-of-N Ranking for Semantic Change Captioning
 
+![Data Examples](data_example.pdf)
+
 This repository provides the official implementation of the semi-supervised pipeline introduced in **"Ranking the Changes: Reinforced Best-of-N Ranking with Retrieval-Augmented Vision-Language Models for Semantic Change Captioning"**. This framework generates high-quality semantic change captioning datasets by aligning visual multi-temporal evidence with natural language descriptions.
 
 ---
 
 ## 🛰️ Overview
 
-While traditional change detection identifies where pixel-level changes occurred, change captioning explains what changed using natural language. The framework utilizes a novel hierarchical filtering approach to mitigate the high cost and inconsistency of manual annotation in the remote sensing domain.
+Traditional change detection identifies *where* pixels changed; our pipeline explains *what* changed using natural language. The framework utilizes a novel hierarchical filtering approach to mitigate the high cost and inconsistency of manual annotation in the remote sensing domain.
 
 ### Key Contributions
 * **Semi-supervised Pipeline:** An end-to-end framework that jointly supports change region identification and semantic description generation without requiring paired mask supervision.
@@ -45,7 +47,7 @@ pip install -r requirements.txt
     ```bash
     huggingface-cli login
     ```
-2.  **Gemini API:** Export your key for automated evaluation and captioning:
+2.  **Gemini API:** Export your key for automated captioning:
     ```bash
     export GOOGLE_API_KEY='your_api_key_here'
     ```
@@ -57,7 +59,7 @@ pip install -r requirements.txt
 The core of our approach resolves semantic ambiguity by selecting an optimal change candidate through a retrieval-augmented preference model. 
 
 1.  **Semantic Screening:** Candidates are discarded if the expected class does not appear in the Top-K predictions of the "After" image patch.
-2.  **Best-of-N Ranking:** Ambiguous cases are forwarded to an LLM judge ($J_{\phi}$) that scores candidates (1–5) against retrieved RAG examples from human annotations.
+2.  **Best-of-N Ranking:** Ambiguous cases are forwarded to an LLM judge ($J_{\phi}$) that scores candidates ($1–5$) against retrieved RAG examples from human annotations.
 3.  **Policy Improvement:** Only candidates that maximize the preference score or exceed a predefined threshold ($\tau$) are retained.
 
 ---
@@ -66,12 +68,10 @@ The core of our approach resolves semantic ambiguity by selecting an optimal cha
 
 The generated dataset includes visual reasoning questions for temporal satellite image pairs, capturing semantic changes such as new construction, demolition, or vegetation loss.
 
-> **See [data_example.pdf](data_example.pdf)** for detailed visual samples of these changes.
-
 ### Sample Output Format
 Each sample consists of a temporal pair accompanied by a generated question:
 * **Yes/No:** "Is there a new house visible now at the bottom-left of the cul-de-sac?".
-* **Multiple-Choice:** captures discrete interpretations such as "Several new residential buildings have been constructed around the cul-de-sac".
+* **Multiple-Choice:** captures discrete interpretations such as "Several new residential buildings have been constructed".
 
 ---
 
@@ -87,12 +87,9 @@ python main.py \
 ```
 
 ### 2. Run Benchmarks
-Evaluate model performance using established metrics (Accuracy, BLEU, BERTScore, CIDEr, SPICE):
+Evaluate model performance using established metrics (BLEU, BERTScore, CIDEr, SPICE):
 ```bash
 python gemma_evaluation.py --input ./output/SCC_dataset.jsonl --output ./results/metrics.csv
 ```
 
 ---
-
-## ⚖️ Anonymity & Citation
-This repository is anonymized for the NeurIPS 2026 review process. It uses imagery from the public LEVIR-CD benchmark.
