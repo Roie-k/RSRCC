@@ -1,6 +1,5 @@
 import argparse
 import io
-import json
 import logging
 import re
 import time
@@ -21,7 +20,7 @@ logger = logging.getLogger(__name__)
 
 class GeminiEvaluator:
     """
-    Evaluate final RSRCC benchmark samples using Gemini 2.5 Flash.
+    Evaluate final benchmark samples using Gemini 2.5 Flash.
 
     Supported task types:
     - yes_no
@@ -44,26 +43,51 @@ class GeminiEvaluator:
         return Image.open(io.BytesIO(image_bytes)).convert("RGB")
 
     @staticmethod
-    def _build_yes_no_prompt(question: str) -> str:
-        return (
-            "You are a precise satellite imagery analyst. "
-            "Answer the following question about the two images.\n\n"
-            "Return exactly one word: Yes or No.\n\n"
-            f"Question: {question}"
-        )
+    def _parse_yes_no(text: str) -> Optional[str]:
+        match = re.search(r"\b(Yes|No)\b", text, flags=re.IGNORECASE)
+        if match is None:
+            return None
+        return match.group(1).capitalize()
 
     @staticmethod
-    def _build_mcq_prompt(question: str, options: Dict[str, str]) -> str:
-        return (
-            "You are a precise satellite imagery analyst. "
-            "Answer the following multiple-choice question about the two images.\n\n"
-            "Return exactly one letter: A, B, C, or D.\n\n"
-            f"Question: {question}\n"
-            f"A) {options['A']}\n"
-            f"B) {options['B']}\n"
-            f"C) {options['C']}\n"
-            f"D) {options['D']}"
-        )
+    def _parse_mcq(text: str) -> Optional[str]:
+        match = re.search(r"\b([ABCD])\b", text, flags=re.IGNORECASE)
+        if match is None:
+            return None
+        return match.group(1).upper()
+
+    def _build_prompt(self, row: Dict[str, Any]) -> Optional[str]:
+        task_type = row.get("task_type")
+        question = row.get("question")
+
+        if not question:
+            return None
+
+        if task_type == "yes_no":
+            return (
+                "Answer the user's question about the two images. "
+                "Return only Yes or No.\n\n"
+                f"{question}"
+            )
+
+        if task_type == "mcq":
+            options = row.get("options")
+            if not isinstance(options, dict):
+                return None
+            if not all(k in options for k in ("A", "B", "C", "D")):
+                return None
+
+            return (
+                "Answer the user's multiple-choice question about the two images. "
+                "Return only the correct letter: A, B, C, or D.\n\n"
+                f"{question}\n"
+                f"A) {options['A']}\n"
+                f"B) {options['B']}\n"
+                f"C) {options['C']}\n"
+                f"D) {options['D']}"
+            )
+
+        return None
 
     def _call_gemini(
         self,
@@ -96,55 +120,35 @@ class GeminiEvaluator:
             logger.error("Gemini evaluation error: %s", exc)
             return None
 
-    @staticmethod
-    def _parse_yes_no(text: str) -> Optional[str]:
-        text = text.strip()
-        match = re.search(r"\b(Yes|No)\b", text, flags=re.IGNORECASE)
-        if not match:
-            return None
-        return match.group(1).capitalize()
-
-    @staticmethod
-    def _parse_mcq(text: str) -> Optional[str]:
-        text = text.strip()
-        match = re.search(r"\b([ABCD])\b", text, flags=re.IGNORECASE)
-        if not match:
-            return None
-        return match.group(1).upper()
-
     def evaluate_sample(self, row: Dict[str, Any]) -> Optional[str]:
         task_type = row.get("task_type")
         before_image_hex = row.get("before_image_hex")
         after_image_hex = row.get("after_image_hex")
-        question = row.get("question")
 
-        if not before_image_hex or not after_image_hex or not question:
+        if not before_image_hex or not after_image_hex:
+            return None
+
+        prompt = self._build_prompt(row)
+        if prompt is None:
+            return None
+
+        raw_output = self._call_gemini(
+            before_image_hex=before_image_hex,
+            after_image_hex=after_image_hex,
+            prompt=prompt,
+        )
+        if raw_output is None:
             return None
 
         if task_type == "yes_no":
-            prompt = self._build_yes_no_prompt(question)
-            raw_output = self._call_gemini(before_image_hex, after_image_hex, prompt)
-            if raw_output is None:
-                return None
             return self._parse_yes_no(raw_output)
-
         if task_type == "mcq":
-            options = row.get("options")
-            if not isinstance(options, dict):
-                return None
-            if not all(k in options for k in ("A", "B", "C", "D")):
-                return None
-
-            prompt = self._build_mcq_prompt(question, options)
-            raw_output = self._call_gemini(before_image_hex, after_image_hex, prompt)
-            if raw_output is None:
-                return None
             return self._parse_mcq(raw_output)
 
         return None
 
     def run_benchmark(self, input_path: str, output_path: str) -> None:
-        logger.info("Starting Gemini benchmark on %s", input_path)
+        logger.info("Running Gemini benchmark on %s", input_path)
 
         if input_path.endswith(".csv"):
             df = pd.read_csv(input_path)
@@ -180,10 +184,10 @@ class GeminiEvaluator:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Gemini-based RSRCC evaluation")
+    parser = argparse.ArgumentParser(description="Gemini-based benchmark evaluation")
     parser.add_argument("--api_key", required=True, help="Google GenAI API key")
-    parser.add_argument("--input_data", required=True, help="Path to evaluation dataset")
-    parser.add_argument("--output_results", required=True, help="Path to save predictions")
+    parser.add_argument("--input_data", required=True, help="Input CSV/JSONL path")
+    parser.add_argument("--output_results", required=True, help="Output results CSV path")
     parser.add_argument("--model", default="gemini-2.5-flash", help="Gemini model version")
     parser.add_argument("--sleep_seconds", type=float, default=0.5, help="Delay between API calls")
     args = parser.parse_args()
