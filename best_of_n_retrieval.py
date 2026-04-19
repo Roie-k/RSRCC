@@ -1,8 +1,7 @@
-"""Gemma 3-4B reward model library for Best-of-N selection in change detection."""
-
 import logging
 import re
-from typing import List, Tuple, Optional, Dict, Any
+from io import BytesIO
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -10,104 +9,208 @@ import torch
 from PIL import Image
 from transformers import AutoProcessor, Gemma3ForConditionalGeneration
 
-# Configure logging to provide clear pipeline tracking
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
 class BestOfNVerifier:
-    """Runs Gemma 3-4B verification on image patches for Best-of-N ranking."""
+    """
+    Retrieval-augmented Gemma 3 verifier for semantic class validation on
+    localized satellite image patches.
 
-    def __init__(self, model_id: str = "google/gemma-3-4b-it"):
-        """
-        Initializes the BestOfNVerifier with the official Gemma 3-4B model.
+    This module follows the paper's reward-style verification setup:
+    - retrieve few-shot examples for the queried class
+    - present examples + query patch to Gemma 3
+    - extract a scalar score in {1,2,3,4,5}
 
-        Args:
-            model_id: The official Hugging Face model identifier.
-        """
-        self.device: str = "cuda" if torch.cuda.is_available() else "cpu"
-        self.dtype: torch.dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
-        
-        logger.info("Loading Gemma 3-4B model from %s...", model_id)
-        # Load multimodal processor and model as documented in Hugging Face
-        self.processor: AutoProcessor = AutoProcessor.from_pretrained(model_id)
-        self.model: Gemma3ForConditionalGeneration = Gemma3ForConditionalGeneration.from_pretrained(
+    Note:
+        This implements the paper's prompt-based patch scoring formulation.
+        It does not implement a full multi-hypothesis Best-of-N search loop by itself.
+        Higher-level orchestration can call this scorer across candidate hypotheses.
+    """
+
+    def __init__(
+        self,
+        model_id: str = "google/gemma-3-4b-it",
+        max_examples: int = 5,
+        patch_size: Tuple[int, int] = (224, 224),
+        do_pan_and_scan: bool = False,
+    ) -> None:
+        self.model_id = model_id
+        self.max_examples = max_examples
+        self.patch_size = patch_size
+        self.do_pan_and_scan = do_pan_and_scan
+
+        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        if torch.cuda.is_available() and torch.cuda.is_bf16_supported():
+            self.dtype = torch.bfloat16
+        elif torch.cuda.is_available():
+            self.dtype = torch.float16
+        else:
+            self.dtype = torch.float32
+
+        logger.info("Loading Gemma 3 model: %s", model_id)
+        self.processor = AutoProcessor.from_pretrained(model_id)
+        self.model = Gemma3ForConditionalGeneration.from_pretrained(
             model_id,
             device_map="auto",
             torch_dtype=self.dtype,
         ).eval()
-        logger.info("Gemma 3-4B model loaded successfully on %s.", self.device)
+        logger.info("Gemma 3 loaded successfully.")
+
+    @staticmethod
+    def _safe_int(value: Any) -> int:
+        return int(round(float(value)))
 
     def _get_extended_patch(
-        self, 
-        image: Image.Image, 
-        xmin: int, 
-        ymin: int, 
-        w: int, 
-        h: int
+        self,
+        image: Image.Image,
+        xmin: int,
+        ymin: int,
+        width: int,
+        height: int,
+        expansion_ratio: float = 0.5,
     ) -> Image.Image:
         """
-        Extracts an extended patch from a full image.
-
-        Args:
-            image: The source PIL image.
-            xmin: X-coordinate of the bounding box.
-            ymin: Y-coordinate of the bounding box.
-            w: Width of the bounding box.
-            h: Height of the bounding box.
-
-        Returns:
-            A cropped PIL image with 50% contextual expansion.
+        Crop a patch with context expansion around the original box.
         """
+        if image.mode != "RGB":
+            image = image.convert("RGB")
+
         img_width, img_height = image.size
 
-        # Expand bounding box by 50% in each direction
-        x_expansion: float = np.ceil(w / 2)
-        y_expansion: float = np.ceil(h / 2)
-        
-        expanded_xmin: int = int(max(0, xmin - x_expansion))
-        expanded_ymin: int = int(max(0, ymin - y_expansion))
-        expanded_xmax: int = int(min(img_width, xmin + w + x_expansion))
-        expanded_ymax: int = int(min(img_height, ymin + h + y_expansion))
+        x_expand = int(np.ceil(width * expansion_ratio))
+        y_expand = int(np.ceil(height * expansion_ratio))
 
-        return image.crop((expanded_xmin, expanded_ymin, expanded_xmax, expanded_ymax))
+        x0 = max(0, xmin - x_expand)
+        y0 = max(0, ymin - y_expand)
+        x1 = min(img_width, xmin + width + x_expand)
+        y1 = min(img_height, ymin + height + y_expand)
+
+        return image.crop((x0, y0, x1, y1))
+
+    def _load_image_from_row(self, row: pd.Series) -> Image.Image:
+        """
+        Load a PIL image from a dataframe row.
+
+        Expected:
+        - row['image_bytes'] contains raw bytes
+        """
+        raw = row["image_bytes"]
+        if isinstance(raw, bytes):
+            image = Image.open(BytesIO(raw)).convert("RGB")
+            return image
+
+        raise TypeError(
+            "Unsupported image storage format in examples_df['image_bytes']. "
+            "Expected raw bytes."
+        )
 
     def _get_images_by_class(
         self,
         query_class: str,
         examples_df: pd.DataFrame,
-        target_size: Tuple[int, int],
-    ) -> List[Image.Image]:
+    ) -> Tuple[List[Image.Image], List[int]]:
         """
-        Retrieves few-shot reference images for a specific semantic class.
-
-        Args:
-            query_class: The semantic class name to filter for.
-            examples_df: DataFrame containing reference image bytes and metadata.
-            target_size: The (width, height) to resize images for the VLM.
-
-        Returns:
-            A list of PIL Images resized to target_size.
+        Retrieve few-shot example patches and their numeric scores for a semantic class.
         """
+        required_cols = {"Class", "Score", "image_bytes", "xmin", "ymin", "width", "height"}
+        missing = required_cols - set(examples_df.columns)
+        if missing:
+            raise ValueError(f"examples_df is missing required columns: {sorted(missing)}")
+
+        class_df = examples_df[examples_df["Class"] == query_class].head(self.max_examples)
+
         images: List[Image.Image] = []
-        matching_df: pd.DataFrame = examples_df[examples_df['Class'] == query_class].head(5)
+        scores: List[int] = []
 
-        for _, row in matching_df.iterrows():
-            # Assume examples are stored as PIL-compatible bytes or objects
-            # In a public repo, we use standard PIL opening logic
-            from io import BytesIO
-            full_image: Image.Image = Image.open(BytesIO(row['image_bytes'])).convert("RGB")
-            
-            patch: Image.Image = self._get_extended_patch(
-                full_image, 
-                int(row['xmin']), 
-                int(row['ymin']), 
-                int(row['width']), 
-                int(row['height'])
+        for _, row in class_df.iterrows():
+            full_image = self._load_image_from_row(row)
+            patch = self._get_extended_patch(
+                image=full_image,
+                xmin=self._safe_int(row["xmin"]),
+                ymin=self._safe_int(row["ymin"]),
+                width=self._safe_int(row["width"]),
+                height=self._safe_int(row["height"]),
+            ).resize(self.patch_size)
+
+            images.append(patch)
+            scores.append(self._safe_int(row["Score"]))
+
+        return images, scores
+
+    @staticmethod
+    def _build_paper_prompt(selected_class: str) -> str:
+        """
+        Exact paper-aligned scoring instruction.
+        """
+        return (
+            "You are an expert in recognizing objects from satellite images. "
+            f"Your task is to score a query image patch from 1 to 5. "
+            f"You need to specify if {selected_class} appears in the image. "
+            "All images are satellite images. Return only the numerical score "
+            "(1, 2, 3, 4, or 5).\n\n"
+            f"5: There is definitely a {selected_class} in the last image. "
+            "The object's shape, shadow, and features are clearly visible from above.\n"
+            f"4: Very likely that the image contains a {selected_class}. "
+            "Features are mostly clear.\n"
+            f"3: Probably the image contains a {selected_class}, but visibility or details are ambiguous.\n"
+            f"2: Unlikely that a {selected_class} appears in the image.\n"
+            f"1: Definitely does not contain a {selected_class}."
+        )
+
+    def _build_messages_and_images(
+        self,
+        selected_class: str,
+        support_images: List[Image.Image],
+        support_scores: List[int],
+        query_patch: Image.Image,
+    ) -> Tuple[List[Dict[str, Any]], List[Image.Image]]:
+        """
+        Build Gemma 3 multimodal messages and aligned image list.
+
+        Important:
+            For Gemma 3, every {'type': 'image'} slot in the chat content must
+            correspond to an image in the images list passed to apply_chat_template().
+        """
+        prompt_text = self._build_paper_prompt(selected_class)
+
+        content: List[Dict[str, Any]] = [{"type": "text", "text": prompt_text}]
+
+        image_batch: List[Image.Image] = []
+
+        for idx, (img, score) in enumerate(zip(support_images, support_scores), start=1):
+            content.extend(
+                [
+                    {"type": "text", "text": f"Example ({idx}):"},
+                    {"type": "image"},
+                    {"type": "text", "text": f"Score = {score}"},
+                ]
             )
-            images.append(patch.resize(target_size))
+            image_batch.append(img)
 
-        return images
+        content.extend(
+            [
+                {"type": "text", "text": f"Example ({len(support_images) + 1}):"},
+                {"type": "image"},
+                {"type": "text", "text": "Score = ?"},
+            ]
+        )
+        image_batch.append(query_patch)
+
+        messages = [{"role": "user", "content": content}]
+        return messages, image_batch
+
+    @staticmethod
+    def _extract_score(response: str) -> Optional[int]:
+        """
+        Extract the first integer score in [1, 5] from the model response.
+        """
+        match = re.search(r"\b([1-5])\b", response)
+        if match:
+            return int(match.group(1))
+        return None
 
     def run_verification(
         self,
@@ -116,105 +219,88 @@ class BestOfNVerifier:
         change_metadata: Dict[str, Any],
         image_num_to_verify: int,
         examples_df: pd.DataFrame,
+        max_new_tokens: int = 16,
     ) -> Optional[int]:
         """
-        Runs Gemma 3-4B verification on an image patch to generate a reward score.
+        Score whether the target semantic class appears in a localized patch.
 
         Args:
-            img1: PIL image from timestamp 1.
-            img2: PIL image from timestamp 2.
-            change_metadata: Dict containing 'class_name', 'xmin', 'ymin', 'width', 'height'.
-            image_num_to_verify: 1 or 2, indicating which image contains the class.
-            examples_df: DataFrame with few-shot examples and scores.
+            img1: First temporal image.
+            img2: Second temporal image.
+            change_metadata: Must contain:
+                - class_name
+                - xmin
+                - ymin
+                - width
+                - height
+            image_num_to_verify:
+                - 1 => verify patch from img1
+                - 2 => verify patch from img2
+            examples_df: Few-shot examples dataframe.
+            max_new_tokens: Generation length for Gemma output.
 
         Returns:
-            The reward score as an integer (1-5), or None if parsing fails.
+            Integer score in [1, 5], or None if parsing fails.
         """
-        selected_class: str = change_metadata['class_name']
-        logger.info("Running Gemma verification for class: '%s'...", selected_class)
-        target_size: Tuple[int, int] = (224, 224)
+        required_keys = {"class_name", "xmin", "ymin", "width", "height"}
+        missing = required_keys - set(change_metadata.keys())
+        if missing:
+            raise ValueError(f"change_metadata missing required keys: {sorted(missing)}")
 
-        # 1. Retrieve RAG Few-Shot Examples
-        all_matching_images: List[Image.Image] = self._get_images_by_class(
+        selected_class = str(change_metadata["class_name"])
+        logger.info("Running Gemma verification for class '%s'", selected_class)
+
+        support_images, support_scores = self._get_images_by_class(
             query_class=selected_class,
             examples_df=examples_df,
-            target_size=target_size
         )
-        
-        matching_scores: List[int] = examples_df[
-            examples_df['Class'] == selected_class
-        ]['Score'].head(len(all_matching_images)).tolist()
 
-        # 2. Construct the Interleaved Chat Prompt
-        messages = [
-            {
-                "role": "user",
-                "content": [
-                    {
-                        "type": "text", 
-                        "text": (
-                            "You are an expert in recognizing objects from satellite images. "
-                            f"Your task is to score a query image patch from 1 to 5 to verify if '{selected_class}' appears.\n\n"
-                            "## Scoring Guide\n"
-                            "* **5:** Definitely visible. Features and shadows are clear.\n"
-                            "* **4:** Very likely. Features are mostly clear.\n"
-                            "* **3:** Ambiguous. Likely does not contain the object.\n"
-                            "* **2:** Unlikely.\n"
-                            "* **1:** Definitely NOT present.\n"
-                        )
-                    }
-                ]
-            }
-        ]
+        if len(support_images) == 0:
+            logger.warning("No few-shot examples found for class '%s'", selected_class)
 
-        # Add reference images to the user message
-        images_for_gemma: List[Image.Image] = []
-        for i, (img, score) in enumerate(zip(all_matching_images, matching_scores)):
-            images_for_gemma.append(img)
-            messages[0]["content"].extend([
-                {"type": "text", "text": f"Example {i+1} (Score = {score}):"},
-                {"type": "image"}
-            ])
+        base_image = img1 if image_num_to_verify == 1 else img2
+        query_patch = self._get_extended_patch(
+            image=base_image.convert("RGB"),
+            xmin=self._safe_int(change_metadata["xmin"]),
+            ymin=self._safe_int(change_metadata["ymin"]),
+            width=self._safe_int(change_metadata["width"]),
+            height=self._safe_int(change_metadata["height"]),
+        ).resize(self.patch_size)
 
-        # 3. Add the actual Query Patch
-        query_base_img: Image.Image = img1 if image_num_to_verify == 1 else img2
-        query_patch: Image.Image = self._get_extended_patch(
-            query_base_img,
-            change_metadata['xmin'],
-            change_metadata['ymin'],
-            change_metadata['width'],
-            change_metadata['height']
-        ).resize(target_size)
-        
-        images_for_gemma.append(query_patch)
-        messages[0]["content"].extend([
-            {"type": "text", "text": "Query Image:"},
-            {"type": "image"},
-            {"type": "text", "text": "Numerical Score (1-5):"}
-        ])
+        messages, image_batch = self._build_messages_and_images(
+            selected_class=selected_class,
+            support_images=support_images,
+            support_scores=support_scores,
+            query_patch=query_patch,
+        )
 
-        # 4. Model Inference
+        # Gemma 3 multimodal processing:
+        # pass both the structured messages and the actual images list.
         inputs = self.processor.apply_chat_template(
             messages,
-            add_generation_prompt=True,
+            images=image_batch,
             tokenize=True,
             return_dict=True,
-            return_tensors="pt"
-        ).to(self.device)
+            return_tensors="pt",
+            add_generation_prompt=True,
+            do_pan_and_scan=self.do_pan_and_scan,
+        ).to(self.model.device)
 
         with torch.inference_mode():
-            output_ids: torch.Tensor = self.model.generate(**inputs, max_new_tokens=10, do_sample=False)
-            response: str = self.processor.decode(
-                output_ids[0][inputs.input_ids.shape[-1]:], 
-                skip_special_tokens=True
+            output_ids = self.model.generate(
+                **inputs,
+                max_new_tokens=max_new_tokens,
+                do_sample=False,
             )
 
-        # 5. Reward Extraction
-        match = re.search(r'[1-5]', response)
-        if match:
-            gemma_score: int = int(match.group())
-            logger.info("Gemma reward score: %d", gemma_score)
-            return gemma_score
-        
-        logger.warning("Could not parse score from response: %s", response)
-        return None
+        prompt_len = inputs["input_ids"].shape[-1]
+        generated_ids = output_ids[0][prompt_len:]
+        response = self.processor.decode(generated_ids, skip_special_tokens=True).strip()
+
+        score = self._extract_score(response)
+        if score is None:
+            logger.warning("Could not parse score from Gemma response: %s", response)
+            return None
+
+        logger.info("Gemma score for class '%s': %d", selected_class, score)
+        return score
