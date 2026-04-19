@@ -4,7 +4,7 @@ from pathlib import Path
 from PIL import Image
 
 from change_detection_core import ChangeDetectionCore
-from best_of_n_retreival import BestOfNVerifier
+from best_of_n_retrieval import BestOfNVerifier
 from dataset_construction import DatasetConstructor
 
 
