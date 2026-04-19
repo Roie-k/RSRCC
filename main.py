@@ -24,15 +24,15 @@ def load_image_pairs(input_dir: str):
 
 def image_to_bytes(img: Image.Image) -> bytes:
     import io
-    buf = io.BytesIO()
-    img.save(buf, format="JPEG")
-    return buf.getvalue()
+    buffer = io.BytesIO()
+    img.save(buffer, format="JPEG")
+    return buffer.getvalue()
 
 
 def run_pipeline(args):
     detector = ChangeDetectionCore(
         backend=args.segmentation_backend,
-        model_id=args.segmentation_model if args.segmentation_model else None,
+        model_id=args.segmentation_model,
     )
     verifier = BestOfNVerifier(model_id=args.reward_model)
     constructor = DatasetConstructor(output_file=args.output_file)
@@ -108,7 +108,11 @@ if __name__ == "__main__":
     parser.add_argument("--input_dir", required=True)
     parser.add_argument("--examples_csv", required=True)
     parser.add_argument("--output_file", default="prompt_requests.jsonl")
-    parser.add_argument("--segmentation_backend", default="mask2former", choices=["mask2former", "segformer"])
+    parser.add_argument(
+        "--segmentation_backend",
+        default="mask2former",
+        choices=["mask2former", "segformer"],
+    )
     parser.add_argument("--segmentation_model", default=None)
     parser.add_argument("--reward_model", default="google/gemma-3-4b-it")
     parser.add_argument("--reward_threshold", type=int, default=4)
