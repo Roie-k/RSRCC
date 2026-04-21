@@ -1,4 +1,4 @@
-# RSRCC: Semantic Remote Sensing Reasoning Change Captioning via Best-of-N Ranking and Retrieval-Augmented Vision-Language Curation
+# RSRCC: Remote Sensing Regional Change Comprehension for Localized Change Question Answering via Retrieval-Augmented Best-of-$N$ Ranking
 
 ![Data Examples](data_example.png)
 
