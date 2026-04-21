@@ -1,4 +1,4 @@
-# RSRCC: Remote Sensing Regional Change Comprehension for Localized Change Question Answering via Retrieval-Augmented Best-of-$N$ Ranking
+# RSRCC: Remote Sensing Regional Change Comprehension Benchmark Constructed via Retrieval-Augmented Best-of-N Ranking
 
 ![Data Examples](data_example.png)
 
