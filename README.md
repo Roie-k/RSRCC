@@ -226,3 +226,10 @@ Each sample consists of a temporal pair accompanied by a generated question:
 * **Multiple-Choice:** captures discrete interpretations such as "Several new residential buildings have been constructed".
 
 ---
+
+## License
+
+This code is released under the Apache License 2.0. See `LICENSE` for details.
+The RSRCC dataset is hosted separately on Hugging Face:
+https://huggingface.co/datasets/google/RSRCC
+Users must also comply with the licenses and terms of the underlying data and external models.
